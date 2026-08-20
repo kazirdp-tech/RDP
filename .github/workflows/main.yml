@@ -12,46 +12,28 @@ jobs:
 
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" `
-            -Value 0 `
-            -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
 
-          # Disable Network Level Authentication
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" `
-            -Value 0 `
-            -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
 
-          # Use RDP security layer
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" `
-            -Value 0 `
-            -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
 
-          # Enable RDP firewall rules
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
 
-          netsh advfirewall firewall add rule `
-            name="RDP-Tailscale" `
-            dir=in `
-            action=allow `
-            protocol=TCP `
-            localport=3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
 
-          # Restart RDP service
           Restart-Service -Name TermService -Force
+
 
       - name: Create RDP User
         run: |
           $username = "RDP"
           $password = "Kazi01071994"
 
-          # Remove old user if it exists
           $existingUser = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
 
           if ($existingUser) {
@@ -59,7 +41,6 @@ jobs:
               Start-Sleep -Seconds 2
           }
 
-          # Create fixed-password local account
           $securePassword = ConvertTo-SecureString `
             $password `
             -AsPlainText `
@@ -72,52 +53,68 @@ jobs:
             -PasswordNeverExpires `
             -UserMayNotChangePassword
 
-          # Add to Administrators
           Add-LocalGroupMember `
             -Group "Administrators" `
             -Member $username
 
-          # Add to Remote Desktop Users
           Add-LocalGroupMember `
             -Group "Remote Desktop Users" `
             -Member $username
 
-          # Verify account
-          $user = Get-LocalUser -Name $username
-
-          if (-not $user) {
+          if (-not (Get-LocalUser -Name "RDP")) {
               Write-Error "RDP user creation failed"
               exit 1
           }
 
           Write-Host "RDP user created successfully."
 
-      - name: Configure RDP Authentication
+
+      - name: Enable Windows Automatic Logon
         run: |
-          # Make sure the RDP user is enabled
-          Enable-LocalUser -Name "RDP"
+          $winlogon = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
 
-          # Ensure password is set correctly
-          $password = "Kazi01071994"
-
-          $securePassword = ConvertTo-SecureString `
-            $password `
-            -AsPlainText `
+          # Enable automatic Windows logon
+          Set-ItemProperty `
+            -Path $winlogon `
+            -Name "AutoAdminLogon" `
+            -Value "1" `
+            -Type String `
             -Force
 
-          Set-LocalUser `
-            -Name "RDP" `
-            -Password $securePassword `
-            -PasswordNeverExpires $true
+          # Username
+          Set-ItemProperty `
+            -Path $winlogon `
+            -Name "DefaultUserName" `
+            -Value "RDP" `
+            -Type String `
+            -Force
 
-          # Verify RDP service
-          Set-Service `
-            -Name TermService `
-            -StartupType Automatic
+          # Password
+          Set-ItemProperty `
+            -Path $winlogon `
+            -Name "DefaultPassword" `
+            -Value "Kazi01071994" `
+            -Type String `
+            -Force
 
-          Start-Service -Name TermService -ErrorAction SilentlyContinue
+          # Local computer
+          Set-ItemProperty `
+            -Path $winlogon `
+            -Name "DefaultDomainName" `
+            -Value $env:COMPUTERNAME `
+            -Type String `
+            -Force
 
-          Write-Host "RDP authentication configured."
+          # Force automatic logon
+          Set-ItemProperty `
+            -Path $winlogon `
+            -Name "ForceAutoLogon" `
+            -Value "1" `
+            -Type String `
+            -Force
+
+          Write-Host "Windows automatic logon configured."
+
 
       - name: Install Tailscale
         run: |
@@ -135,65 +132,127 @@ jobs:
 
           Remove-Item $installerPath -Force
 
-      - name: Establish Tailscale Connection
-        run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
-            --hostname=gh-runner-$env:GITHUB_RUN_ID
 
+      - name: Tailscale Browser Authorization
+        shell: powershell
+        run: |
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          $logFile = "$env:TEMP\tailscale-auth.log"
+          $errFile = "$env:TEMP\tailscale-auth-error.log"
+
+          Remove-Item $logFile -Force -ErrorAction SilentlyContinue
+          Remove-Item $errFile -Force -ErrorAction SilentlyContinue
+
+          Write-Host "Starting Tailscale browser authentication..."
+
+          $process = Start-Process `
+            -FilePath $tailscale `
+            -ArgumentList @(
+              "up",
+              "--unattended=true",
+              "--hostname=gh-runner-$env:GITHUB_RUN_ID"
+            ) `
+            -RedirectStandardOutput $logFile `
+            -RedirectStandardError $errFile `
+            -PassThru `
+            -WindowStyle Hidden
+
+          $authUrl = $null
+          $retries = 0
+
+          while (-not $authUrl -and $retries -lt 60) {
+
+              if (Test-Path $logFile) {
+                  $output = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
+
+                  if ($output) {
+                      $match = [regex]::Match(
+                        $output,
+                        'https://login\.tailscale\.com/[^\s]+'
+                      )
+
+                      if ($match.Success) {
+                          $authUrl = $match.Value.Trim()
+                          break
+                      }
+                  }
+              }
+
+              Start-Sleep -Seconds 2
+              $retries++
+          }
+
+          if ($authUrl) {
+
+              Write-Host ""
+              Write-Host "=============================================="
+              Write-Host " TAILSCALE BROWSER AUTHORIZATION REQUIRED"
+              Write-Host "=============================================="
+              Write-Host $authUrl
+              Write-Host "=============================================="
+              Write-Host ""
+
+              # Put clickable URL in GitHub Actions summary
+              Add-Content `
+                -Path $env:GITHUB_STEP_SUMMARY `
+                -Value "## Tailscale Authorization`n`n[**OPEN TAILSCALE AUTHORIZATION LINK**]($authUrl)`n`nOpen this link in your phone browser and authorize the VM."
+
+          } else {
+
+              Write-Host "No authentication URL was generated."
+              Write-Host "Tailscale may already be authenticated."
+
+          }
+
+          # Wait until Tailscale becomes authenticated
           $tsIP = $null
           $retries = 0
 
-          while (-not $tsIP -and $retries -lt 20) {
+          while (-not $tsIP -and $retries -lt 180) {
 
-              $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
+              try {
+                  $tsIP = (& $tailscale ip -4 2>$null).Trim()
+              } catch {
+                  $tsIP = $null
+              }
 
               if ($tsIP) {
                   break
               }
 
+              Write-Host "Waiting for browser authorization... ($retries/180)"
               Start-Sleep -Seconds 5
               $retries++
           }
 
           if (-not $tsIP) {
-              Write-Error "Tailscale IP was not assigned."
+              Write-Error "Tailscale authorization was not completed."
               exit 1
           }
 
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
+          Write-Host ""
+          Write-Host "Tailscale connected successfully."
           Write-Host "Tailscale IP: $tsIP"
+
 
       - name: Verify RDP Accessibility
         run: |
-          Write-Host "Testing RDP port 3389..."
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
 
           $testResult = Test-NetConnection `
             -ComputerName $env:TAILSCALE_IP `
             -Port 3389
 
           if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed."
+              Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
           }
 
-          Write-Host "RDP port 3389 is accessible."
+          Write-Host "TCP connectivity successful!"
 
-      - name: Verify RDP User
-        run: |
-          Write-Host "Checking RDP account..."
-
-          $user = Get-LocalUser -Name "RDP"
-
-          if (-not $user.Enabled) {
-              Write-Error "RDP account is disabled."
-              exit 1
-          }
-
-          Write-Host "Username: .\RDP"
-          Write-Host "RDP account is enabled."
-          Write-Host "RDP service is running."
 
       - name: Maintain Connection
         run: |
